@@ -40,12 +40,14 @@ function sameType(a: Type, b: Type): boolean {
 type ExprAst =
   | { kind: "var"; name: string }
   | { kind: "field"; base: ExprAst; field: string }
-  | { kind: "binary"; op: "+"; left: ExprAst; right: ExprAst };
+  | { kind: "binary"; op: "+"; left: ExprAst; right: ExprAst }
+  | { kind: "call"; fn: string; typeArgs: Type[]; args: ExprAst[] };
 
 type FnAst = {
   name: string;
   typeParams: string[];
   params: { name: string; ty: Type }[];
+  returnTy: Type;
   body: ExprAst;
 };
 
@@ -62,6 +64,7 @@ const addXAst: FnAst = {
     { name: "a", ty: { kind: "generic", name: "T" } },
     { name: "b", ty: { kind: "generic", name: "T" } },
   ],
+  returnTy: Int,
   body: {
     kind: "binary",
     op: "+",
@@ -75,6 +78,40 @@ const addXAst: FnAst = {
       base: { kind: "var", name: "b" },
       field: "x",
     },
+  },
+};
+
+const genericInnerAst: FnAst = {
+  name: "genericInner",
+  typeParams: ["T"],
+  params: [{ name: "x", ty: { kind: "generic", name: "T" } }],
+  returnTy: { kind: "generic", name: "T" },
+  body: { kind: "var", name: "x" },
+};
+
+const genericOuterAst: FnAst = {
+  name: "genericOuter",
+  typeParams: ["T"],
+  params: [{ name: "x", ty: { kind: "generic", name: "T" } }],
+  returnTy: { kind: "generic", name: "T" },
+  body: {
+    kind: "call",
+    fn: "genericInner",
+    typeArgs: [{ kind: "generic", name: "T" }],
+    args: [{ kind: "var", name: "x" }],
+  },
+};
+
+const regularFnAst: FnAst = {
+  name: "regularFn",
+  typeParams: [],
+  params: [{ name: "x", ty: Int }],
+  returnTy: Int,
+  body: {
+    kind: "call",
+    fn: "genericOuter",
+    typeArgs: [Int],
+    args: [{ kind: "var", name: "x" }],
   },
 };
 
@@ -197,6 +234,8 @@ type CtInstr =
   | { op: "prove_trait_bound"; out: string; trait: string; typeReg: string }
   | { op: "project_assoc_type"; out: string; traitRefReg: string; assocType: string }
   | { op: "resolve_method_call"; out: string; traitRefReg: string; method: string }
+  | { op: "resolve_function_symbol"; out: string; fn: string }
+  | { op: "request_fn_instantiation"; fnReg: string; typeArgRegs: string[] }
   | { op: "instantiate_generic_symbol"; out: string; symbolReg: string; typeArgRegs: string[] }
   | { op: "return"; valueReg: string };
 
@@ -496,6 +535,41 @@ class Compiler {
           break;
         }
 
+        case "resolve_function_symbol": {
+          const callee = this.templates.get(instr.fn);
+          if (!callee) throw new Error(`unknown template function ${instr.fn}`);
+
+          regs.set(instr.out, {
+            kind: "symbol",
+            value: callee.id,
+          });
+          break;
+        }
+
+        case "request_fn_instantiation": {
+          const fn = read(instr.fnReg);
+          if (fn.kind !== "symbol") throw new Error("expected symbol");
+
+          const callee = this.templates.get(fn.value);
+          if (!callee) throw new Error(`unknown template function ${fn.value}`);
+
+          const typeArgsForCall = instr.typeArgRegs.map(reg => {
+            const value = read(reg);
+            if (value.kind === "type") return value.value;
+            if (value.kind === "assoc_type") return value.value.ty;
+            throw new Error("expected type-like register");
+          });
+
+          if (typeArgsForCall.length !== callee.typeParams.length) {
+            throw new Error(
+              `function ${fn.value} expected ${callee.typeParams.length} type args, got ${typeArgsForCall.length}`
+            );
+          }
+
+          this.request(callee.id, typeArgsForCall);
+          break;
+        }
+
         case "instantiate_generic_symbol": {
           const symbol = read(instr.symbolReg);
           if (symbol.kind !== "symbol") throw new Error("expected symbol");
@@ -567,12 +641,13 @@ type LoweredExpr = {
 
 type LowerCtx = {
   template: TemplateFunction;
+  functions: Map<string, FnAst>;
   locals: Map<string, TypeExpr>;
   nextReg(): string;
   nextHole(name: string): HoleId;
 };
 
-function lowerFunction(ast: FnAst): TemplateFunction {
+function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunction {
   let regCounter = 0;
   let holeCounter = 0;
 
@@ -585,6 +660,7 @@ function lowerFunction(ast: FnAst): TemplateFunction {
 
   const ctx: LowerCtx = {
     template,
+    functions,
     locals: new Map(),
 
     nextReg() {
@@ -631,7 +707,73 @@ function lowerExpr(expr: ExprAst, ctx: LowerCtx): LoweredExpr {
 
     case "binary":
       return lowerAdd(expr.left, expr.right, ctx);
+
+    case "call":
+      return lowerCall(expr, ctx);
   }
+}
+
+function substFnType(t: Type, callee: FnAst, callTypeArgs: TypeExpr[]): TypeExpr {
+  if (t.kind !== "generic") return { kind: "type", value: t };
+
+  const index = callee.typeParams.indexOf(t.name);
+  if (index === -1) return { kind: "type", value: t };
+  return callTypeArgs[index];
+}
+
+function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): LoweredExpr {
+  const callee = ctx.functions.get(expr.fn);
+  if (!callee) throw new Error(`unknown function ${expr.fn}`);
+
+  if (callee.params.length !== expr.args.length) {
+    throw new Error(`function ${expr.fn} expected ${callee.params.length} args, got ${expr.args.length}`);
+  }
+
+  if (callee.typeParams.length !== expr.typeArgs.length) {
+    throw new Error(`function ${expr.fn} expected ${callee.typeParams.length} type args, got ${expr.typeArgs.length}`);
+  }
+
+  const loweredArgs = expr.args.map(arg => lowerExpr(arg, ctx));
+  const callTypeArgs: TypeExpr[] = expr.typeArgs.map(ty => ({ kind: "type", value: ty }));
+
+  const symbolHole = ctx.nextHole(`call_${expr.fn}`);
+  const typeArgRegs: string[] = [];
+  const instrs: CtInstr[] = [];
+
+  for (let i = 0; i < callTypeArgs.length; i++) {
+    const reg = `T${i}`;
+    instrs.push({
+      op: "resolve_type_expr",
+      out: reg,
+      typeExpr: callTypeArgs[i],
+    });
+    typeArgRegs.push(reg);
+  }
+
+  instrs.push({ op: "resolve_function_symbol", out: "FnBase", fn: expr.fn });
+  instrs.push({ op: "request_fn_instantiation", fnReg: "FnBase", typeArgRegs });
+  instrs.push({
+    op: "instantiate_generic_symbol",
+    out: "Fn",
+    symbolReg: "FnBase",
+    typeArgRegs,
+  });
+  instrs.push({ op: "return", valueReg: "Fn" });
+
+  ctx.template.holes[symbolHole] = { instrs };
+
+  const out = ctx.nextReg();
+  ctx.template.runtime.push({
+    op: "call",
+    out,
+    fn: { kind: "hole", id: symbolHole },
+    args: loweredArgs.map(arg => arg.reg),
+  });
+
+  return {
+    reg: out,
+    ty: substFnType(callee.returnTy, callee, callTypeArgs),
+  };
 }
 
 function lowerField(expr: Extract<ExprAst, { kind: "field" }>, ctx: LowerCtx): LoweredExpr {
@@ -833,18 +975,35 @@ compiler.impls.push({
   },
 });
 
-const template = lowerFunction(addXAst);
+const programFns: FnAst[] = [addXAst, genericInnerAst, genericOuterAst, regularFnAst];
+const fnIndex = new Map(programFns.map(fn => [fn.name, fn]));
 
-compiler.templates.set(template.id, template);
+const templates = programFns.map(fn => lowerFunction(fn, fnIndex));
+for (const template of templates) {
+  compiler.templates.set(template.id, template);
+}
 
 console.log("\n=== Lowered template IR ===\n");
-printTemplate(template);
+for (const template of templates) {
+  printTemplate(template);
+  console.log("");
+}
 
-compiler.request("addX", [Point]);
+compiler.request("regularFn", []);
 compiler.run();
 
 console.log("\n=== Specialised concrete IR ===\n");
 
-for (const [name, body] of compiler.emitted) {
+const emittedNames = [...compiler.emitted.keys()].sort();
+console.log("emitted:", emittedNames.join(", "));
+
+const expected = ["regularFn", "genericOuter__Int", "genericInner__Int"];
+const missing = expected.filter(name => !compiler.emitted.has(name));
+if (missing.length > 0) {
+  throw new Error(`missing expected specialisations: ${missing.join(", ")}`);
+}
+
+for (const name of emittedNames) {
+  const body = compiler.emitted.get(name)!;
   printConcrete(name, body);
 }
