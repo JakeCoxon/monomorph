@@ -16,7 +16,11 @@ type Type =
   | { kind: "generic"; name: string };
 
 const Int: Type = { kind: "prim", name: "Int" };
+const Float: Type = { kind: "prim", name: "Float" };
 const Point: Type = { kind: "struct", name: "Point" };
+const Pixel: Type = { kind: "struct", name: "Pixel" };
+const Pair: Type = { kind: "struct", name: "Pair" };
+const PointF: Type = { kind: "struct", name: "PointF" };
 
 function showType(t: Type): string {
   switch (t.kind) {
@@ -110,6 +114,32 @@ const regularFnAst: FnAst = {
   body: {
     kind: "call",
     fn: "genericOuter",
+    typeArgs: [Int],
+    args: [{ kind: "var", name: "x" }],
+  },
+};
+
+const badArityCallAst: FnAst = {
+  name: "badArityCall",
+  typeParams: [],
+  params: [{ name: "x", ty: Int }],
+  returnTy: Int,
+  body: {
+    kind: "call",
+    fn: "genericOuter",
+    typeArgs: [],
+    args: [{ kind: "var", name: "x" }],
+  },
+};
+
+const badUnknownCallAst: FnAst = {
+  name: "badUnknownCall",
+  typeParams: [],
+  params: [{ name: "x", ty: Int }],
+  returnTy: Int,
+  body: {
+    kind: "call",
+    fn: "doesNotExist",
     typeArgs: [Int],
     args: [{ kind: "var", name: "x" }],
   },
@@ -916,94 +946,370 @@ function printConcrete(name: string, body: ConcreteInstr[]) {
 // Run demo
 // -----------------------------
 
-const compiler = new Compiler();
+type DemoRequest = { fn: string; typeArgs: Type[] };
 
-compiler.traits.set("Add", {
-  name: "Add",
-  typeParams: ["Rhs"],
-  assocTypes: ["Output"],
-  methods: {
-    add: {
-      name: "add",
-      typeParams: [],
-      params: [
-        { name: "lhs", ty: { kind: "type", value: { kind: "generic", name: "Self" } } },
-        { name: "rhs", ty: { kind: "type", value: { kind: "generic", name: "Rhs" } } },
+type DemoScenario = {
+  name: string;
+  programFns?: FnAst[];
+  manualTemplates?: TemplateFunction[];
+  requests: DemoRequest[];
+  expectedEmittedExact?: string[];
+  expectedErrorContains?: string;
+  showTemplates?: boolean;
+};
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function assertEqualList(actual: string[], expected: string[], label: string) {
+  const actualSorted = [...actual].sort();
+  const expectedSorted = [...expected].sort();
+  if (JSON.stringify(actualSorted) !== JSON.stringify(expectedSorted)) {
+    throw new Error(
+      `${label} mismatch\nexpected: ${expectedSorted.join(", ")}\nactual: ${actualSorted.join(", ")}`
+    );
+  }
+}
+
+function registerBaseEnvironment(compiler: Compiler, includeIntAddImpl = true) {
+  compiler.traits.set("Add", {
+    name: "Add",
+    typeParams: ["Rhs"],
+    assocTypes: ["Output"],
+    methods: {
+      add: {
+        name: "add",
+        typeParams: [],
+        params: [
+          { name: "lhs", ty: { kind: "type", value: { kind: "generic", name: "Self" } } },
+          { name: "rhs", ty: { kind: "type", value: { kind: "generic", name: "Rhs" } } },
+        ],
+        returnTy: { kind: "type", value: { kind: "generic", name: "Output" } },
+        where: [],
+      },
+    },
+  });
+
+  compiler.layouts.set(showType(Int), {
+    size: 8,
+    align: 8,
+    fields: {},
+  });
+
+  compiler.layouts.set(showType(Point), {
+    size: 16,
+    align: 8,
+    fields: {
+      x: { offset: 0, ty: Int },
+      y: { offset: 8, ty: Int },
+    },
+  });
+
+  compiler.layouts.set(showType(Pixel), {
+    size: 24,
+    align: 8,
+    fields: {
+      tag: { offset: 0, ty: Int },
+      x: { offset: 8, ty: Int },
+      y: { offset: 16, ty: Int },
+    },
+  });
+
+  if (!includeIntAddImpl) return;
+  compiler.impls.push({
+    trait: "Add",
+    forType: Int,
+    where: [],
+    methods: {
+      add: "Int_add",
+    },
+    assocTypes: {
+      Output: Int,
+    },
+    methodSigs: {
+      add: {
+        name: "add",
+        typeParams: [],
+        params: [
+          { name: "lhs", ty: { kind: "type", value: Int } },
+          { name: "rhs", ty: { kind: "type", value: Int } },
+        ],
+        returnTy: { kind: "type", value: Int },
+        where: [],
+      },
+    },
+  });
+}
+
+function makeTypeArgTemplate(): TemplateFunction {
+  return {
+    id: "manualTypeArg",
+    typeParams: ["T"],
+    runtime: [
+      { op: "param", name: "x", ty: { kind: "hole", id: "arg_ty" } },
+      { op: "return", value: "x" },
+    ],
+    holes: {
+      arg_ty: {
+        instrs: [
+          { op: "get_type_arg", out: "T0", index: 0 },
+          { op: "return", valueReg: "T0" },
+        ],
+      },
+    },
+  };
+}
+
+function makeLegacyAddTemplate(): TemplateFunction {
+  return {
+    id: "legacyAdd",
+    typeParams: ["T"],
+    runtime: [
+      { op: "param", name: "a", ty: { kind: "hole", id: "arg_ty" } },
+      { op: "param", name: "b", ty: { kind: "hole", id: "arg_ty" } },
+      { op: "call", out: "%0", fn: { kind: "hole", id: "add_fn" }, args: ["a", "b"] },
+      { op: "return", value: "%0" },
+    ],
+    holes: {
+      arg_ty: {
+        instrs: [
+          { op: "get_type_arg", out: "T0", index: 0 },
+          { op: "return", valueReg: "T0" },
+        ],
+      },
+      add_fn: {
+        instrs: [
+          { op: "get_type_arg", out: "T0", index: 0 },
+          { op: "resolve_trait", out: "Impl", trait: "Add", typeReg: "T0" },
+          { op: "trait_method", out: "FnRaw", implReg: "Impl", method: "add" },
+          {
+            op: "instantiate_generic_symbol",
+            out: "Fn",
+            symbolReg: "FnRaw",
+            typeArgRegs: ["T0"],
+          },
+          { op: "return", valueReg: "Fn" },
+        ],
+      },
+    },
+  };
+}
+
+function runScenario(
+  scenario: DemoScenario,
+  setup?: (compiler: Compiler) => void
+) {
+  console.log(`\n=== Scenario: ${scenario.name} ===\n`);
+
+  const compiler = new Compiler();
+  registerBaseEnvironment(compiler);
+  setup?.(compiler);
+
+  try {
+    const programFns = scenario.programFns ?? [];
+    const fnIndex = new Map(programFns.map(fn => [fn.name, fn] as const));
+    const lowered = programFns.map(fn => lowerFunction(fn, fnIndex));
+    const templates = [...lowered, ...(scenario.manualTemplates ?? [])];
+
+    for (const template of templates) {
+      compiler.templates.set(template.id, template);
+    }
+
+    if (scenario.showTemplates) {
+      for (const template of templates) {
+        printTemplate(template);
+        console.log("");
+      }
+    }
+
+    for (const request of scenario.requests) {
+      compiler.request(request.fn, request.typeArgs);
+    }
+
+    compiler.run();
+
+    const emittedNames = [...compiler.emitted.keys()].sort();
+    console.log("emitted:", emittedNames.join(", "));
+
+    if (scenario.expectedErrorContains) {
+      throw new Error(`expected scenario to fail with: ${scenario.expectedErrorContains}`);
+    }
+
+    if (scenario.expectedEmittedExact) {
+      assertEqualList(emittedNames, scenario.expectedEmittedExact, scenario.name);
+    }
+
+    for (const name of emittedNames) {
+      printConcrete(name, compiler.emitted.get(name)!);
+    }
+  } catch (e) {
+    const message = errorMessage(e);
+    if (!scenario.expectedErrorContains) throw e;
+    if (!message.includes(scenario.expectedErrorContains)) {
+      throw new Error(
+        `${scenario.name} expected error containing "${scenario.expectedErrorContains}" but got "${message}"`
+      );
+    }
+    console.log(`expected error: ${message}`);
+  }
+}
+
+const scenarios: Array<{
+  scenario: DemoScenario;
+  setup?: (compiler: Compiler) => void;
+}> = [
+  {
+    scenario: {
+      name: "field reflection + trait dispatch + assoc projection",
+      programFns: [addXAst],
+      requests: [
+        { fn: "addX", typeArgs: [Point] },
+        { fn: "addX", typeArgs: [Pixel] },
+        { fn: "addX", typeArgs: [PointF] },
       ],
-      returnTy: { kind: "type", value: { kind: "generic", name: "Output" } },
-      where: [],
+      expectedEmittedExact: ["addX__Point", "addX__Pixel", "addX__PointF"],
+      showTemplates: true,
+    },
+    setup: compiler => {
+      compiler.layouts.set(showType(PointF), {
+        size: 16,
+        align: 8,
+        fields: {
+          x: { offset: 0, ty: Float },
+          y: { offset: 8, ty: Float },
+        },
+      });
+
+      compiler.impls.push({
+        trait: "Add",
+        forType: Float,
+        where: [],
+        methods: {
+          add: "Float_add",
+        },
+        assocTypes: {
+          Output: Float,
+        },
+        methodSigs: {
+          add: {
+            name: "add",
+            typeParams: [],
+            params: [
+              { name: "lhs", ty: { kind: "type", value: Float } },
+              { name: "rhs", ty: { kind: "type", value: Float } },
+            ],
+            returnTy: { kind: "type", value: Float },
+            where: [],
+          },
+        },
+      });
     },
   },
-});
-
-compiler.layouts.set("Int", {
-  size: 8,
-  align: 8,
-  fields: {},
-});
-
-compiler.layouts.set("Point", {
-  size: 16,
-  align: 8,
-  fields: {
-    x: { offset: 0, ty: Int },
-    y: { offset: 8, ty: Int },
-  },
-});
-
-compiler.impls.push({
-  trait: "Add",
-  forType: Int,
-  where: [],
-  methods: {
-    add: "Int_add",
-  },
-  assocTypes: {
-    Output: Int,
-  },
-  methodSigs: {
-    add: {
-      name: "add",
-      typeParams: [],
-      params: [
-        { name: "lhs", ty: { kind: "type", value: Int } },
-        { name: "rhs", ty: { kind: "type", value: Int } },
+  {
+    scenario: {
+      name: "generic -> generic + regular -> generic",
+      programFns: [genericInnerAst, genericOuterAst, regularFnAst],
+      requests: [
+        { fn: "regularFn", typeArgs: [] },
+        { fn: "genericOuter", typeArgs: [Float] },
       ],
-      returnTy: { kind: "type", value: Int },
-      where: [],
+      expectedEmittedExact: [
+        "regularFn",
+        "genericOuter__Int",
+        "genericInner__Int",
+        "genericOuter__Float",
+        "genericInner__Float",
+      ],
+      showTemplates: true,
     },
   },
-});
+  {
+    scenario: {
+      name: "dedup across repeated requests",
+      programFns: [genericInnerAst, genericOuterAst, regularFnAst],
+      requests: [
+        { fn: "regularFn", typeArgs: [] },
+        { fn: "regularFn", typeArgs: [] },
+        { fn: "genericOuter", typeArgs: [Int] },
+        { fn: "genericInner", typeArgs: [Int] },
+      ],
+      expectedEmittedExact: ["regularFn", "genericOuter__Int", "genericInner__Int"],
+    },
+  },
+  {
+    scenario: {
+      name: "manual get_type_arg",
+      manualTemplates: [makeTypeArgTemplate()],
+      requests: [{ fn: "manualTypeArg", typeArgs: [Int] }],
+      expectedEmittedExact: ["manualTypeArg__Int"],
+    },
+  },
+  {
+    scenario: {
+      name: "legacy resolve_trait + trait_method",
+      manualTemplates: [makeLegacyAddTemplate()],
+      requests: [{ fn: "legacyAdd", typeArgs: [Int] }],
+      expectedEmittedExact: ["legacyAdd__Int"],
+    },
+  },
+  {
+    scenario: {
+      name: "error missing field",
+      programFns: [addXAst],
+      requests: [{ fn: "addX", typeArgs: [Pair] }],
+      expectedErrorContains: "unknown field x",
+    },
+    setup: compiler => {
+      compiler.layouts.set(showType(Pair), {
+        size: 16,
+        align: 8,
+        fields: {
+          a: { offset: 0, ty: Int },
+          b: { offset: 8, ty: Int },
+        },
+      });
+    },
+  },
+  {
+    scenario: {
+      name: "error missing trait impl",
+      programFns: [addXAst],
+      requests: [{ fn: "addX", typeArgs: [PointF] }],
+      expectedErrorContains: "no impl Add for Float",
+    },
+    setup: compiler => {
+      compiler.layouts.set(showType(PointF), {
+        size: 16,
+        align: 8,
+        fields: {
+          x: { offset: 0, ty: Float },
+          y: { offset: 8, ty: Float },
+        },
+      });
+    },
+  },
+  {
+    scenario: {
+      name: "error bad generic arity",
+      programFns: [genericInnerAst, genericOuterAst, badArityCallAst],
+      requests: [],
+      expectedErrorContains: "function genericOuter expected 1 type args, got 0",
+    },
+  },
+  {
+    scenario: {
+      name: "error unknown callee",
+      programFns: [badUnknownCallAst],
+      requests: [],
+      expectedErrorContains: "unknown function doesNotExist",
+    },
+  },
+];
 
-const programFns: FnAst[] = [addXAst, genericInnerAst, genericOuterAst, regularFnAst];
-const fnIndex = new Map(programFns.map(fn => [fn.name, fn]));
-
-const templates = programFns.map(fn => lowerFunction(fn, fnIndex));
-for (const template of templates) {
-  compiler.templates.set(template.id, template);
+for (const item of scenarios) {
+  runScenario(item.scenario, item.setup);
 }
 
-console.log("\n=== Lowered template IR ===\n");
-for (const template of templates) {
-  printTemplate(template);
-  console.log("");
-}
-
-compiler.request("regularFn", []);
-compiler.run();
-
-console.log("\n=== Specialised concrete IR ===\n");
-
-const emittedNames = [...compiler.emitted.keys()].sort();
-console.log("emitted:", emittedNames.join(", "));
-
-const expected = ["regularFn", "genericOuter__Int", "genericInner__Int"];
-const missing = expected.filter(name => !compiler.emitted.has(name));
-if (missing.length > 0) {
-  throw new Error(`missing expected specialisations: ${missing.join(", ")}`);
-}
-
-for (const name of emittedNames) {
-  const body = compiler.emitted.get(name)!;
-  printConcrete(name, body);
-}
+console.log(`\nall scenarios passed: ${scenarios.length}/${scenarios.length}`);
