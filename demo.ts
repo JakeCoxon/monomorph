@@ -97,6 +97,60 @@ type ConstExpr =
   | { kind: "const"; value: number }
   | { kind: "hole"; id: HoleId };
 
+type WhereClause =
+  | {
+      kind: "trait_bound";
+      typeExpr: TypeExpr;
+      trait: string;
+    }
+  | {
+      kind: "assoc_eq";
+      typeExpr: TypeExpr;
+      trait: string;
+      assocType: string;
+      equals: TypeExpr;
+    };
+
+type MethodSig = {
+  name: string;
+  typeParams: string[];
+  params: { name: string; ty: TypeExpr }[];
+  returnTy: TypeExpr;
+  where: WhereClause[];
+};
+
+type TraitDef = {
+  name: string;
+  typeParams: string[];
+  assocTypes: string[];
+  methods: Record<string, MethodSig>;
+};
+
+type ImplDef = {
+  trait: string;
+  forType: Type;
+  where: WhereClause[];
+  methods: Record<string, SymbolId>;
+  assocTypes: Record<string, Type>;
+  methodSigs: Record<string, MethodSig>;
+};
+
+type TraitRef = {
+  trait: string;
+  forType: Type;
+};
+
+type AssocTypeRef = {
+  traitRef: TraitRef;
+  name: string;
+  ty: Type;
+};
+
+type FnSigRef = {
+  symbol: SymbolId;
+  sig: MethodSig;
+};
+
 type RuntimeInstr =
   | { op: "param"; name: string; ty: TypeExpr }
   | { op: "field_ptr"; out: string; base: string; offset: ConstExpr }
@@ -126,8 +180,11 @@ type CtValue =
   | { kind: "type"; value: Type }
   | { kind: "layout"; value: Layout }
   | { kind: "const"; value: number }
-  | { kind: "impl"; value: Impl }
-  | { kind: "symbol"; value: SymbolId };
+  | { kind: "impl"; value: ImplDef }
+  | { kind: "symbol"; value: SymbolId }
+  | { kind: "trait_ref"; value: TraitRef }
+  | { kind: "assoc_type"; value: AssocTypeRef }
+  | { kind: "fn_sig"; value: FnSigRef };
 
 type CtInstr =
   | { op: "get_type_arg"; out: string; index: number }
@@ -137,6 +194,10 @@ type CtInstr =
   | { op: "field_type"; out: string; layoutReg: string; field: string }
   | { op: "resolve_trait"; out: string; trait: string; typeReg: string }
   | { op: "trait_method"; out: string; implReg: string; method: string }
+  | { op: "prove_trait_bound"; out: string; trait: string; typeReg: string }
+  | { op: "project_assoc_type"; out: string; traitRefReg: string; assocType: string }
+  | { op: "resolve_method_call"; out: string; traitRefReg: string; method: string }
+  | { op: "instantiate_generic_symbol"; out: string; symbolReg: string; typeArgRegs: string[] }
   | { op: "return"; valueReg: string };
 
 type CtBlock = {
@@ -153,11 +214,7 @@ type Layout = {
   fields: Record<string, { offset: number; ty: Type }>;
 };
 
-type Impl = {
-  trait: string;
-  forType: Type;
-  methods: Record<string, SymbolId>;
-};
+type Impl = ImplDef;
 
 // -----------------------------
 // Compiler
@@ -165,6 +222,7 @@ type Impl = {
 
 class Compiler {
   templates = new Map<string, TemplateFunction>();
+  traits = new Map<string, TraitDef>();
   layouts = new Map<string, Layout>();
   impls: Impl[] = [];
 
@@ -243,8 +301,9 @@ class Compiler {
     }
 
     const v = this.resolveHole(template, typeArgs, expr.id);
-    if (v.kind !== "type") throw new Error(`hole ${expr.id} did not return type`);
-    return v.value;
+    if (v.kind === "type") return v.value;
+    if (v.kind === "assoc_type") return v.value.ty;
+    throw new Error(`hole ${expr.id} did not return type`);
   }
 
   resolveConstExpr(template: TemplateFunction, typeArgs: Type[], expr: ConstExpr): number {
@@ -369,6 +428,92 @@ class Compiler {
           break;
         }
 
+        case "prove_trait_bound": {
+          const t = read(instr.typeReg);
+          if (t.kind !== "type") throw new Error("expected type");
+
+          this.resolveTrait(instr.trait, t.value);
+          regs.set(instr.out, {
+            kind: "trait_ref",
+            value: {
+              trait: instr.trait,
+              forType: t.value,
+            },
+          });
+          break;
+        }
+
+        case "project_assoc_type": {
+          const traitRef = read(instr.traitRefReg);
+          if (traitRef.kind !== "trait_ref") throw new Error("expected trait ref");
+
+          const impl = this.resolveTrait(traitRef.value.trait, traitRef.value.forType);
+          const ty = impl.assocTypes[instr.assocType];
+          if (!ty) {
+            throw new Error(
+              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no associated type ${instr.assocType}`
+            );
+          }
+
+          regs.set(instr.out, {
+            kind: "assoc_type",
+            value: {
+              traitRef: traitRef.value,
+              name: instr.assocType,
+              ty,
+            },
+          });
+          break;
+        }
+
+        case "resolve_method_call": {
+          const traitRef = read(instr.traitRefReg);
+          if (traitRef.kind !== "trait_ref") throw new Error("expected trait ref");
+
+          const impl = this.resolveTrait(traitRef.value.trait, traitRef.value.forType);
+          const method = impl.methods[instr.method];
+          if (!method) {
+            throw new Error(
+              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no method ${instr.method}`
+            );
+          }
+
+          const sig = impl.methodSigs[instr.method];
+          if (sig) {
+            regs.set(`${instr.out}_sig`, {
+              kind: "fn_sig",
+              value: {
+                symbol: method,
+                sig,
+              },
+            });
+          }
+
+          regs.set(instr.out, {
+            kind: "symbol",
+            value: method,
+          });
+          break;
+        }
+
+        case "instantiate_generic_symbol": {
+          const symbol = read(instr.symbolReg);
+          if (symbol.kind !== "symbol") throw new Error("expected symbol");
+
+          const typeArgsForSymbol = instr.typeArgRegs.map(reg => {
+            const value = read(reg);
+            if (value.kind === "type") return value.value;
+            if (value.kind === "assoc_type") return value.value.ty;
+            throw new Error("expected type-like register");
+          });
+
+          regs.set(instr.out, {
+            kind: "symbol",
+            value: this.instantiateSymbol(symbol.value, typeArgsForSymbol),
+          });
+          break;
+        }
+
         case "return": {
           return read(instr.valueReg);
         }
@@ -389,6 +534,11 @@ class Compiler {
     const impl = this.impls.find(i => i.trait === trait && sameType(i.forType, t));
     if (!impl) throw new Error(`no impl ${trait} for ${showType(t)}`);
     return impl;
+  }
+
+  instantiateSymbol(symbol: SymbolId, typeArgs: Type[]): SymbolId {
+    if (typeArgs.length === 0) return symbol;
+    return `${symbol}__${typeArgs.map(showType).join("__")}`;
   }
 
   substType(template: TemplateFunction, typeArgs: Type[], t: Type): Type {
@@ -541,17 +691,24 @@ function lowerAdd(leftAst: ExprAst, rightAst: ExprAst, ctx: LowerCtx): LoweredEx
   ctx.template.holes[methodHole] = {
     instrs: [
       { op: "resolve_type_expr", out: "T", typeExpr: left.ty },
-      { op: "resolve_trait", out: "Impl", trait: "Add", typeReg: "T" },
-      { op: "trait_method", out: "Fn", implReg: "Impl", method: "add" },
+      { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
+      { op: "resolve_method_call", out: "FnRaw", traitRefReg: "AddRef", method: "add" },
+      {
+        op: "instantiate_generic_symbol",
+        out: "Fn",
+        symbolReg: "FnRaw",
+        typeArgRegs: ["T"],
+      },
       { op: "return", valueReg: "Fn" },
     ],
   };
 
-  // Tiny demo simplification: Add<T>.Output = T.
   ctx.template.holes[resultTypeHole] = {
     instrs: [
       { op: "resolve_type_expr", out: "T", typeExpr: left.ty },
-      { op: "return", valueReg: "T" },
+      { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
+      { op: "project_assoc_type", out: "Output", traitRefReg: "AddRef", assocType: "Output" },
+      { op: "return", valueReg: "Output" },
     ],
   };
 
@@ -619,6 +776,24 @@ function printConcrete(name: string, body: ConcreteInstr[]) {
 
 const compiler = new Compiler();
 
+compiler.traits.set("Add", {
+  name: "Add",
+  typeParams: ["Rhs"],
+  assocTypes: ["Output"],
+  methods: {
+    add: {
+      name: "add",
+      typeParams: [],
+      params: [
+        { name: "lhs", ty: { kind: "type", value: { kind: "generic", name: "Self" } } },
+        { name: "rhs", ty: { kind: "type", value: { kind: "generic", name: "Rhs" } } },
+      ],
+      returnTy: { kind: "type", value: { kind: "generic", name: "Output" } },
+      where: [],
+    },
+  },
+});
+
 compiler.layouts.set("Int", {
   size: 8,
   align: 8,
@@ -637,8 +812,24 @@ compiler.layouts.set("Point", {
 compiler.impls.push({
   trait: "Add",
   forType: Int,
+  where: [],
   methods: {
     add: "Int_add",
+  },
+  assocTypes: {
+    Output: Int,
+  },
+  methodSigs: {
+    add: {
+      name: "add",
+      typeParams: [],
+      params: [
+        { name: "lhs", ty: { kind: "type", value: Int } },
+        { name: "rhs", ty: { kind: "type", value: Int } },
+      ],
+      returnTy: { kind: "type", value: Int },
+      where: [],
+    },
   },
 });
 
