@@ -1,8 +1,8 @@
 // demo.ts
 // Self-contained staged monomorphisation demo:
 // - AST lowers to runtime-template IR
-// - Runtime-template IR contains holes
-// - Holes point to CT/specialisation blocks
+// - Runtime-template IR references indexed value slots
+// - A linear CT specialization pass fills unresolved slots
 // - CT blocks support basic reflection and trait resolution
 // - Instantiation injects concrete offsets, types, and method symbols
 
@@ -149,40 +149,30 @@ const badUnknownCallAst: FnAst = {
 // Template IR
 // -----------------------------
 
-type HoleId = string;
 type SymbolId = string;
-
-type TypeExpr =
-  | { kind: "type"; value: Type }
-  | { kind: "hole"; id: HoleId };
-
-type SymbolExpr =
-  | { kind: "symbol"; value: SymbolId }
-  | { kind: "hole"; id: HoleId };
-
-type ConstExpr =
-  | { kind: "const"; value: number }
-  | { kind: "hole"; id: HoleId };
+type TypeIdx = number;
+type ConstIdx = number;
+type SymbolIdx = number;
 
 type WhereClause =
   | {
       kind: "trait_bound";
-      typeExpr: TypeExpr;
+      typeExpr: Type;
       trait: string;
     }
   | {
       kind: "assoc_eq";
-      typeExpr: TypeExpr;
+      typeExpr: Type;
       trait: string;
       assocType: string;
-      equals: TypeExpr;
+      equals: Type;
     };
 
 type MethodSig = {
   name: string;
   typeParams: string[];
-  params: { name: string; ty: TypeExpr }[];
-  returnTy: TypeExpr;
+  params: { name: string; ty: Type }[];
+  returnTy: Type;
   where: WhereClause[];
 };
 
@@ -219,17 +209,30 @@ type FnSigRef = {
 };
 
 type RuntimeInstr =
-  | { op: "param"; name: string; ty: TypeExpr }
-  | { op: "field_ptr"; out: string; base: string; offset: ConstExpr }
-  | { op: "load"; out: string; ptr: string; ty: TypeExpr }
-  | { op: "call"; out: string; fn: SymbolExpr; args: string[] }
+  | { op: "param"; name: string; tyIdx: TypeIdx }
+  | { op: "field_ptr"; out: string; base: string; offsetIdx: ConstIdx }
+  | { op: "load"; out: string; ptr: string; tyIdx: TypeIdx }
+  | { op: "call"; out: string; fnIdx: SymbolIdx; args: string[] }
   | { op: "return"; value: string };
+
+type CtWriteTarget =
+  | { kind: "type"; idx: TypeIdx }
+  | { kind: "const"; idx: ConstIdx }
+  | { kind: "symbol"; idx: SymbolIdx };
+
+type CtWrite = {
+  target: CtWriteTarget;
+  instrs: CtInstr[];
+};
 
 type TemplateFunction = {
   id: string;
   typeParams: string[];
   runtime: RuntimeInstr[];
-  holes: Record<HoleId, CtBlock>;
+  specialize: CtWrite[];
+  typeValues: Array<Type | null>;
+  constValues: Array<number | null>;
+  symbolValues: Array<SymbolId | null>;
 };
 
 type ConcreteInstr =
@@ -253,9 +256,18 @@ type CtValue =
   | { kind: "assoc_type"; value: AssocTypeRef }
   | { kind: "fn_sig"; value: FnSigRef };
 
+type SpecializationState = {
+  typeValues: Array<Type | null>;
+  constValues: Array<number | null>;
+  symbolValues: Array<SymbolId | null>;
+  typeWrites: Set<number>;
+  constWrites: Set<number>;
+  symbolWrites: Set<number>;
+};
+
 type CtInstr =
   | { op: "get_type_arg"; out: string; index: number }
-  | { op: "resolve_type_expr"; out: string; typeExpr: TypeExpr }
+  | { op: "resolve_type_expr"; out: string; typeIdx: TypeIdx }
   | { op: "get_layout"; out: string; typeReg: string }
   | { op: "field_offset"; out: string; layoutReg: string; field: string }
   | { op: "field_type"; out: string; layoutReg: string; field: string }
@@ -268,10 +280,6 @@ type CtInstr =
   | { op: "request_fn_instantiation"; fnReg: string; typeArgRegs: string[] }
   | { op: "instantiate_generic_symbol"; out: string; symbolReg: string; typeArgRegs: string[] }
   | { op: "return"; valueReg: string };
-
-type CtBlock = {
-  instrs: CtInstr[];
-};
 
 // -----------------------------
 // Reflection / trait DB
@@ -299,8 +307,6 @@ class Compiler {
   queue: { fn: string; typeArgs: Type[] }[] = [];
   done = new Set<string>();
 
-  holeCache = new Map<string, CtValue>();
-
   request(fn: string, typeArgs: Type[]) {
     const key = this.mangle(fn, typeArgs);
     if (!this.done.has(key)) {
@@ -325,13 +331,16 @@ class Compiler {
   }
 
   instantiate(template: TemplateFunction, typeArgs: Type[]): ConcreteInstr[] {
+    const state = this.buildSpecializationState(template, typeArgs);
+    this.runSpecializationWrites(template, typeArgs, state);
+
     return template.runtime.map((instr): ConcreteInstr => {
       switch (instr.op) {
         case "param":
           return {
             op: "param",
             name: instr.name,
-            ty: this.resolveTypeExpr(template, typeArgs, instr.ty),
+            ty: this.readTypeIdx(state, instr.tyIdx, `param ${instr.name}`),
           };
 
         case "field_ptr":
@@ -339,7 +348,7 @@ class Compiler {
             op: "field_ptr",
             out: instr.out,
             base: instr.base,
-            offset: this.resolveConstExpr(template, typeArgs, instr.offset),
+            offset: this.readConstIdx(state, instr.offsetIdx, `field_ptr ${instr.out}`),
           };
 
         case "load":
@@ -347,14 +356,14 @@ class Compiler {
             op: "load",
             out: instr.out,
             ptr: instr.ptr,
-            ty: this.resolveTypeExpr(template, typeArgs, instr.ty),
+            ty: this.readTypeIdx(state, instr.tyIdx, `load ${instr.out}`),
           };
 
         case "call":
           return {
             op: "call",
             out: instr.out,
-            fn: this.resolveSymbolExpr(template, typeArgs, instr.fn),
+            fn: this.readSymbolIdx(state, instr.fnIdx, `call ${instr.out}`),
             args: instr.args,
           };
 
@@ -364,47 +373,94 @@ class Compiler {
     });
   }
 
-  resolveTypeExpr(template: TemplateFunction, typeArgs: Type[], expr: TypeExpr): Type {
-    if (expr.kind === "type") {
-      return this.substType(template, typeArgs, expr.value);
+  buildSpecializationState(template: TemplateFunction, typeArgs: Type[]): SpecializationState {
+    return {
+      typeValues: template.typeValues.map(v => (v ? this.substType(template, typeArgs, v) : null)),
+      constValues: [...template.constValues],
+      symbolValues: [...template.symbolValues],
+      typeWrites: new Set<number>(),
+      constWrites: new Set<number>(),
+      symbolWrites: new Set<number>(),
+    };
+  }
+
+  runSpecializationWrites(template: TemplateFunction, typeArgs: Type[], state: SpecializationState) {
+    for (const write of template.specialize) {
+      const value = this.evalCtBlock(template, typeArgs, state, write.instrs);
+
+      switch (write.target.kind) {
+        case "type": {
+          if (state.typeWrites.has(write.target.idx) || state.typeValues[write.target.idx] !== null) {
+            throw new Error(`duplicate specialization write for type idx ${write.target.idx}`);
+          }
+          if (value.kind === "type") {
+            state.typeValues[write.target.idx] = value.value;
+          } else if (value.kind === "assoc_type") {
+            state.typeValues[write.target.idx] = value.value.ty;
+          } else {
+            throw new Error(`specialization write expected type-like value for idx ${write.target.idx}`);
+          }
+          state.typeWrites.add(write.target.idx);
+          break;
+        }
+
+        case "const": {
+          if (state.constWrites.has(write.target.idx) || state.constValues[write.target.idx] !== null) {
+            throw new Error(`duplicate specialization write for const idx ${write.target.idx}`);
+          }
+          if (value.kind !== "const") {
+            throw new Error(`specialization write expected const value for idx ${write.target.idx}`);
+          }
+          state.constValues[write.target.idx] = value.value;
+          state.constWrites.add(write.target.idx);
+          break;
+        }
+
+        case "symbol": {
+          if (state.symbolWrites.has(write.target.idx) || state.symbolValues[write.target.idx] !== null) {
+            throw new Error(`duplicate specialization write for symbol idx ${write.target.idx}`);
+          }
+          if (value.kind !== "symbol") {
+            throw new Error(`specialization write expected symbol value for idx ${write.target.idx}`);
+          }
+          state.symbolValues[write.target.idx] = value.value;
+          state.symbolWrites.add(write.target.idx);
+          break;
+        }
+      }
     }
-
-    const v = this.resolveHole(template, typeArgs, expr.id);
-    if (v.kind === "type") return v.value;
-    if (v.kind === "assoc_type") return v.value.ty;
-    throw new Error(`hole ${expr.id} did not return type`);
   }
 
-  resolveConstExpr(template: TemplateFunction, typeArgs: Type[], expr: ConstExpr): number {
-    if (expr.kind === "const") return expr.value;
-
-    const v = this.resolveHole(template, typeArgs, expr.id);
-    if (v.kind !== "const") throw new Error(`hole ${expr.id} did not return const`);
-    return v.value;
-  }
-
-  resolveSymbolExpr(template: TemplateFunction, typeArgs: Type[], expr: SymbolExpr): SymbolId {
-    if (expr.kind === "symbol") return expr.value;
-
-    const v = this.resolveHole(template, typeArgs, expr.id);
-    if (v.kind !== "symbol") throw new Error(`hole ${expr.id} did not return symbol`);
-    return v.value;
-  }
-
-  resolveHole(template: TemplateFunction, typeArgs: Type[], holeId: HoleId): CtValue {
-    const key = `${this.mangle(template.id, typeArgs)}:${holeId}`;
-    const cached = this.holeCache.get(key);
-    if (cached) return cached;
-
-    const block = template.holes[holeId];
-    if (!block) throw new Error(`missing hole ${holeId}`);
-
-    const value = this.evalCtBlock(template, typeArgs, block);
-    this.holeCache.set(key, value);
+  readTypeIdx(state: SpecializationState, idx: TypeIdx, context: string): Type {
+    const value = state.typeValues[idx];
+    if (value === null || value === undefined) {
+      throw new Error(`unresolved type idx ${idx} while instantiating ${context}`);
+    }
     return value;
   }
 
-  evalCtBlock(template: TemplateFunction, typeArgs: Type[], block: CtBlock): CtValue {
+  readConstIdx(state: SpecializationState, idx: ConstIdx, context: string): number {
+    const value = state.constValues[idx];
+    if (value === null || value === undefined) {
+      throw new Error(`unresolved const idx ${idx} while instantiating ${context}`);
+    }
+    return value;
+  }
+
+  readSymbolIdx(state: SpecializationState, idx: SymbolIdx, context: string): SymbolId {
+    const value = state.symbolValues[idx];
+    if (value === null || value === undefined) {
+      throw new Error(`unresolved symbol idx ${idx} while instantiating ${context}`);
+    }
+    return value;
+  }
+
+  evalCtBlock(
+    template: TemplateFunction,
+    typeArgs: Type[],
+    state: SpecializationState,
+    instrs: CtInstr[]
+  ): CtValue {
     const regs = new Map<string, CtValue>();
 
     const read = (name: string): CtValue => {
@@ -413,7 +469,7 @@ class Compiler {
       return value;
     };
 
-    for (const instr of block.instrs) {
+    for (const instr of instrs) {
       switch (instr.op) {
         case "get_type_arg": {
           regs.set(instr.out, {
@@ -426,7 +482,7 @@ class Compiler {
         case "resolve_type_expr": {
           regs.set(instr.out, {
             kind: "type",
-            value: this.resolveTypeExpr(template, typeArgs, instr.typeExpr),
+            value: this.readTypeIdx(state, instr.typeIdx, "resolve_type_expr"),
           });
           break;
         }
@@ -666,26 +722,33 @@ class Compiler {
 
 type LoweredExpr = {
   reg: string;
-  ty: TypeExpr;
+  tyIdx: TypeIdx;
 };
 
 type LowerCtx = {
   template: TemplateFunction;
   functions: Map<string, FnAst>;
-  locals: Map<string, TypeExpr>;
+  locals: Map<string, TypeIdx>;
   nextReg(): string;
-  nextHole(name: string): HoleId;
+  allocTypeValue(t: Type): TypeIdx;
+  allocConstValue(n: number): ConstIdx;
+  allocSymbolValue(s: SymbolId): SymbolIdx;
+  allocTypeTarget(instrs: CtInstr[]): TypeIdx;
+  allocConstTarget(instrs: CtInstr[]): ConstIdx;
+  allocSymbolTarget(instrs: CtInstr[]): SymbolIdx;
 };
 
 function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunction {
   let regCounter = 0;
-  let holeCounter = 0;
 
   const template: TemplateFunction = {
     id: ast.name,
     typeParams: ast.typeParams,
     runtime: [],
-    holes: {},
+    specialize: [],
+    typeValues: [],
+    constValues: [],
+    symbolValues: [],
   };
 
   const ctx: LowerCtx = {
@@ -697,20 +760,63 @@ function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunct
       return `%${regCounter++}`;
     },
 
-    nextHole(name: string) {
-      return `${name}_${holeCounter++}`;
+    allocTypeValue(t: Type) {
+      const idx = template.typeValues.length;
+      template.typeValues.push(t);
+      return idx;
+    },
+
+    allocConstValue(n: number) {
+      const idx = template.constValues.length;
+      template.constValues.push(n);
+      return idx;
+    },
+
+    allocSymbolValue(s: SymbolId) {
+      const idx = template.symbolValues.length;
+      template.symbolValues.push(s);
+      return idx;
+    },
+
+    allocTypeTarget(instrs: CtInstr[]) {
+      const idx = template.typeValues.length;
+      template.typeValues.push(null);
+      template.specialize.push({
+        target: { kind: "type", idx },
+        instrs,
+      });
+      return idx;
+    },
+
+    allocConstTarget(instrs: CtInstr[]) {
+      const idx = template.constValues.length;
+      template.constValues.push(null);
+      template.specialize.push({
+        target: { kind: "const", idx },
+        instrs,
+      });
+      return idx;
+    },
+
+    allocSymbolTarget(instrs: CtInstr[]) {
+      const idx = template.symbolValues.length;
+      template.symbolValues.push(null);
+      template.specialize.push({
+        target: { kind: "symbol", idx },
+        instrs,
+      });
+      return idx;
     },
   };
 
   for (const param of ast.params) {
-    const ty: TypeExpr = { kind: "type", value: param.ty };
-
-    ctx.locals.set(param.name, ty);
+    const tyIdx = ctx.allocTypeValue(param.ty);
+    ctx.locals.set(param.name, tyIdx);
 
     template.runtime.push({
       op: "param",
       name: param.name,
-      ty,
+      tyIdx,
     });
   }
 
@@ -727,9 +833,9 @@ function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunct
 function lowerExpr(expr: ExprAst, ctx: LowerCtx): LoweredExpr {
   switch (expr.kind) {
     case "var": {
-      const ty = ctx.locals.get(expr.name);
-      if (!ty) throw new Error(`unknown local ${expr.name}`);
-      return { reg: expr.name, ty };
+      const tyIdx = ctx.locals.get(expr.name);
+      if (tyIdx === undefined) throw new Error(`unknown local ${expr.name}`);
+      return { reg: expr.name, tyIdx };
     }
 
     case "field":
@@ -743,11 +849,11 @@ function lowerExpr(expr: ExprAst, ctx: LowerCtx): LoweredExpr {
   }
 }
 
-function substFnType(t: Type, callee: FnAst, callTypeArgs: TypeExpr[]): TypeExpr {
-  if (t.kind !== "generic") return { kind: "type", value: t };
+function substFnType(t: Type, callee: FnAst, callTypeArgs: TypeIdx[], ctx: LowerCtx): TypeIdx {
+  if (t.kind !== "generic") return ctx.allocTypeValue(t);
 
   const index = callee.typeParams.indexOf(t.name);
-  if (index === -1) return { kind: "type", value: t };
+  if (index === -1) return ctx.allocTypeValue(t);
   return callTypeArgs[index];
 }
 
@@ -764,9 +870,7 @@ function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): Low
   }
 
   const loweredArgs = expr.args.map(arg => lowerExpr(arg, ctx));
-  const callTypeArgs: TypeExpr[] = expr.typeArgs.map(ty => ({ kind: "type", value: ty }));
-
-  const symbolHole = ctx.nextHole(`call_${expr.fn}`);
+  const callTypeArgs: TypeIdx[] = expr.typeArgs.map(ty => ctx.allocTypeValue(ty));
   const typeArgRegs: string[] = [];
   const instrs: CtInstr[] = [];
 
@@ -775,7 +879,7 @@ function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): Low
     instrs.push({
       op: "resolve_type_expr",
       out: reg,
-      typeExpr: callTypeArgs[i],
+      typeIdx: callTypeArgs[i],
     });
     typeArgRegs.push(reg);
   }
@@ -790,45 +894,38 @@ function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): Low
   });
   instrs.push({ op: "return", valueReg: "Fn" });
 
-  ctx.template.holes[symbolHole] = { instrs };
+  const symbolIdx = ctx.allocSymbolTarget(instrs);
 
   const out = ctx.nextReg();
   ctx.template.runtime.push({
     op: "call",
     out,
-    fn: { kind: "hole", id: symbolHole },
+    fnIdx: symbolIdx,
     args: loweredArgs.map(arg => arg.reg),
   });
 
   return {
     reg: out,
-    ty: substFnType(callee.returnTy, callee, callTypeArgs),
+    tyIdx: substFnType(callee.returnTy, callee, callTypeArgs, ctx),
   };
 }
 
 function lowerField(expr: Extract<ExprAst, { kind: "field" }>, ctx: LowerCtx): LoweredExpr {
   const base = lowerExpr(expr.base, ctx);
 
-  const offsetHole = ctx.nextHole(`offset_${expr.field}`);
-  const typeHole = ctx.nextHole(`type_${expr.field}`);
+  const offsetIdx = ctx.allocConstTarget([
+    { op: "resolve_type_expr", out: "Base", typeIdx: base.tyIdx },
+    { op: "get_layout", out: "Layout", typeReg: "Base" },
+    { op: "field_offset", out: "Offset", layoutReg: "Layout", field: expr.field },
+    { op: "return", valueReg: "Offset" },
+  ]);
 
-  ctx.template.holes[offsetHole] = {
-    instrs: [
-      { op: "resolve_type_expr", out: "Base", typeExpr: base.ty },
-      { op: "get_layout", out: "Layout", typeReg: "Base" },
-      { op: "field_offset", out: "Offset", layoutReg: "Layout", field: expr.field },
-      { op: "return", valueReg: "Offset" },
-    ],
-  };
-
-  ctx.template.holes[typeHole] = {
-    instrs: [
-      { op: "resolve_type_expr", out: "Base", typeExpr: base.ty },
-      { op: "get_layout", out: "Layout", typeReg: "Base" },
-      { op: "field_type", out: "FieldType", layoutReg: "Layout", field: expr.field },
-      { op: "return", valueReg: "FieldType" },
-    ],
-  };
+  const tyIdx = ctx.allocTypeTarget([
+    { op: "resolve_type_expr", out: "Base", typeIdx: base.tyIdx },
+    { op: "get_layout", out: "Layout", typeReg: "Base" },
+    { op: "field_type", out: "FieldType", layoutReg: "Layout", field: expr.field },
+    { op: "return", valueReg: "FieldType" },
+  ]);
 
   const ptr = ctx.nextReg();
   const out = ctx.nextReg();
@@ -837,19 +934,19 @@ function lowerField(expr: Extract<ExprAst, { kind: "field" }>, ctx: LowerCtx): L
     op: "field_ptr",
     out: ptr,
     base: base.reg,
-    offset: { kind: "hole", id: offsetHole },
+    offsetIdx,
   });
 
   ctx.template.runtime.push({
     op: "load",
     out,
     ptr,
-    ty: { kind: "hole", id: typeHole },
+    tyIdx,
   });
 
   return {
     reg: out,
-    ty: { kind: "hole", id: typeHole },
+    tyIdx,
   };
 }
 
@@ -857,45 +954,38 @@ function lowerAdd(leftAst: ExprAst, rightAst: ExprAst, ctx: LowerCtx): LoweredEx
   const left = lowerExpr(leftAst, ctx);
   const right = lowerExpr(rightAst, ctx);
 
-  const methodHole = ctx.nextHole("add_method");
-  const resultTypeHole = ctx.nextHole("add_result");
+  const methodIdx = ctx.allocSymbolTarget([
+    { op: "resolve_type_expr", out: "T", typeIdx: left.tyIdx },
+    { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
+    { op: "resolve_method_call", out: "FnRaw", traitRefReg: "AddRef", method: "add" },
+    {
+      op: "instantiate_generic_symbol",
+      out: "Fn",
+      symbolReg: "FnRaw",
+      typeArgRegs: ["T"],
+    },
+    { op: "return", valueReg: "Fn" },
+  ]);
 
-  ctx.template.holes[methodHole] = {
-    instrs: [
-      { op: "resolve_type_expr", out: "T", typeExpr: left.ty },
-      { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
-      { op: "resolve_method_call", out: "FnRaw", traitRefReg: "AddRef", method: "add" },
-      {
-        op: "instantiate_generic_symbol",
-        out: "Fn",
-        symbolReg: "FnRaw",
-        typeArgRegs: ["T"],
-      },
-      { op: "return", valueReg: "Fn" },
-    ],
-  };
-
-  ctx.template.holes[resultTypeHole] = {
-    instrs: [
-      { op: "resolve_type_expr", out: "T", typeExpr: left.ty },
-      { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
-      { op: "project_assoc_type", out: "Output", traitRefReg: "AddRef", assocType: "Output" },
-      { op: "return", valueReg: "Output" },
-    ],
-  };
+  const resultTyIdx = ctx.allocTypeTarget([
+    { op: "resolve_type_expr", out: "T", typeIdx: left.tyIdx },
+    { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
+    { op: "project_assoc_type", out: "Output", traitRefReg: "AddRef", assocType: "Output" },
+    { op: "return", valueReg: "Output" },
+  ]);
 
   const out = ctx.nextReg();
 
   ctx.template.runtime.push({
     op: "call",
     out,
-    fn: { kind: "hole", id: methodHole },
+    fnIdx: methodIdx,
     args: [left.reg, right.reg],
   });
 
   return {
     reg: out,
-    ty: { kind: "hole", id: resultTypeHole },
+    tyIdx: resultTyIdx,
   };
 }
 
@@ -910,10 +1000,23 @@ function printTemplate(fn: TemplateFunction) {
     console.log("  " + JSON.stringify(instr));
   }
 
-  console.log("holes:");
-  for (const [id, block] of Object.entries(fn.holes)) {
-    console.log(`  hole ${id}:`);
-    for (const instr of block.instrs) {
+  console.log("type values:");
+  for (let i = 0; i < fn.typeValues.length; i++) {
+    console.log(`  [${i}] = ${fn.typeValues[i] ? showType(fn.typeValues[i]!) : "null"}`);
+  }
+  console.log("const values:");
+  for (let i = 0; i < fn.constValues.length; i++) {
+    console.log(`  [${i}] = ${fn.constValues[i] ?? "null"}`);
+  }
+  console.log("symbol values:");
+  for (let i = 0; i < fn.symbolValues.length; i++) {
+    console.log(`  [${i}] = ${fn.symbolValues[i] ?? "null"}`);
+  }
+
+  console.log("specialize writes:");
+  for (const write of fn.specialize) {
+    console.log(`  write ${write.target.kind}[${write.target.idx}]:`);
+    for (const instr of write.instrs) {
       console.log("    " + JSON.stringify(instr));
     }
   }
@@ -983,10 +1086,10 @@ function registerBaseEnvironment(compiler: Compiler, includeIntAddImpl = true) {
         name: "add",
         typeParams: [],
         params: [
-          { name: "lhs", ty: { kind: "type", value: { kind: "generic", name: "Self" } } },
-          { name: "rhs", ty: { kind: "type", value: { kind: "generic", name: "Rhs" } } },
+          { name: "lhs", ty: { kind: "generic", name: "Self" } },
+          { name: "rhs", ty: { kind: "generic", name: "Rhs" } },
         ],
-        returnTy: { kind: "type", value: { kind: "generic", name: "Output" } },
+        returnTy: { kind: "generic", name: "Output" },
         where: [],
       },
     },
@@ -1033,10 +1136,10 @@ function registerBaseEnvironment(compiler: Compiler, includeIntAddImpl = true) {
         name: "add",
         typeParams: [],
         params: [
-          { name: "lhs", ty: { kind: "type", value: Int } },
-          { name: "rhs", ty: { kind: "type", value: Int } },
+          { name: "lhs", ty: Int },
+          { name: "rhs", ty: Int },
         ],
-        returnTy: { kind: "type", value: Int },
+        returnTy: Int,
         where: [],
       },
     },
@@ -1048,17 +1151,21 @@ function makeTypeArgTemplate(): TemplateFunction {
     id: "manualTypeArg",
     typeParams: ["T"],
     runtime: [
-      { op: "param", name: "x", ty: { kind: "hole", id: "arg_ty" } },
+      { op: "param", name: "x", tyIdx: 0 },
       { op: "return", value: "x" },
     ],
-    holes: {
-      arg_ty: {
+    specialize: [
+      {
+        target: { kind: "type", idx: 0 },
         instrs: [
           { op: "get_type_arg", out: "T0", index: 0 },
           { op: "return", valueReg: "T0" },
         ],
       },
-    },
+    ],
+    typeValues: [null],
+    constValues: [],
+    symbolValues: [],
   };
 }
 
@@ -1067,19 +1174,21 @@ function makeLegacyAddTemplate(): TemplateFunction {
     id: "legacyAdd",
     typeParams: ["T"],
     runtime: [
-      { op: "param", name: "a", ty: { kind: "hole", id: "arg_ty" } },
-      { op: "param", name: "b", ty: { kind: "hole", id: "arg_ty" } },
-      { op: "call", out: "%0", fn: { kind: "hole", id: "add_fn" }, args: ["a", "b"] },
+      { op: "param", name: "a", tyIdx: 0 },
+      { op: "param", name: "b", tyIdx: 0 },
+      { op: "call", out: "%0", fnIdx: 0, args: ["a", "b"] },
       { op: "return", value: "%0" },
     ],
-    holes: {
-      arg_ty: {
+    specialize: [
+      {
+        target: { kind: "type", idx: 0 },
         instrs: [
           { op: "get_type_arg", out: "T0", index: 0 },
           { op: "return", valueReg: "T0" },
         ],
       },
-      add_fn: {
+      {
+        target: { kind: "symbol", idx: 0 },
         instrs: [
           { op: "get_type_arg", out: "T0", index: 0 },
           { op: "resolve_trait", out: "Impl", trait: "Add", typeReg: "T0" },
@@ -1093,7 +1202,10 @@ function makeLegacyAddTemplate(): TemplateFunction {
           { op: "return", valueReg: "Fn" },
         ],
       },
-    },
+    ],
+    typeValues: [null],
+    constValues: [],
+    symbolValues: [null],
   };
 }
 
@@ -1197,10 +1309,10 @@ const scenarios: Array<{
             name: "add",
             typeParams: [],
             params: [
-              { name: "lhs", ty: { kind: "type", value: Float } },
-              { name: "rhs", ty: { kind: "type", value: Float } },
+              { name: "lhs", ty: Float },
+              { name: "rhs", ty: Float },
             ],
-            returnTy: { kind: "type", value: Float },
+            returnTy: Float,
             where: [],
           },
         },
