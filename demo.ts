@@ -17,10 +17,12 @@ type Type =
 
 const Int: Type = { kind: "prim", name: "Int" };
 const Float: Type = { kind: "prim", name: "Float" };
+const Bool: Type = { kind: "prim", name: "Bool" };
 const Point: Type = { kind: "struct", name: "Point" };
 const Pixel: Type = { kind: "struct", name: "Pixel" };
 const Pair: Type = { kind: "struct", name: "Pair" };
 const PointF: Type = { kind: "struct", name: "PointF" };
+const Flagged: Type = { kind: "struct", name: "Flagged" };
 
 function showType(t: Type): string {
   switch (t.kind) {
@@ -153,6 +155,7 @@ type SymbolId = string;
 type TypeIdx = number;
 type ConstIdx = number;
 type SymbolIdx = number;
+type InstrIdx = number;
 
 type WhereClause =
   | {
@@ -213,12 +216,14 @@ type RuntimeInstr =
   | { op: "field_ptr"; out: string; base: string; offsetIdx: ConstIdx }
   | { op: "load"; out: string; ptr: string; tyIdx: TypeIdx }
   | { op: "call"; out: string; fnIdx: SymbolIdx; args: string[] }
+  | { op: "splice"; instrIdx: InstrIdx }
   | { op: "return"; value: string };
 
 type CtWriteTarget =
   | { kind: "type"; idx: TypeIdx }
   | { kind: "const"; idx: ConstIdx }
-  | { kind: "symbol"; idx: SymbolIdx };
+  | { kind: "symbol"; idx: SymbolIdx }
+  | { kind: "instr"; idx: InstrIdx };
 
 type CtWrite = {
   target: CtWriteTarget;
@@ -233,6 +238,7 @@ type TemplateFunction = {
   typeValues: Array<Type | null>;
   constValues: Array<number | null>;
   symbolValues: Array<SymbolId | null>;
+  instrValues: Array<ConcreteInstr[] | null>;
 };
 
 type ConcreteInstr =
@@ -254,15 +260,18 @@ type CtValue =
   | { kind: "symbol"; value: SymbolId }
   | { kind: "trait_ref"; value: TraitRef }
   | { kind: "assoc_type"; value: AssocTypeRef }
-  | { kind: "fn_sig"; value: FnSigRef };
+  | { kind: "fn_sig"; value: FnSigRef }
+  | { kind: "instr_chunk"; value: ConcreteInstr[] };
 
 type SpecializationState = {
   typeValues: Array<Type | null>;
   constValues: Array<number | null>;
   symbolValues: Array<SymbolId | null>;
+  instrValues: Array<ConcreteInstr[] | null>;
   typeWrites: Set<number>;
   constWrites: Set<number>;
   symbolWrites: Set<number>;
+  instrWrites: Set<number>;
 };
 
 type CtInstr =
@@ -274,11 +283,46 @@ type CtInstr =
   | { op: "resolve_trait"; out: string; trait: string; typeReg: string }
   | { op: "trait_method"; out: string; implReg: string; method: string }
   | { op: "prove_trait_bound"; out: string; trait: string; typeReg: string }
-  | { op: "project_assoc_type"; out: string; traitRefReg: string; assocType: string }
-  | { op: "resolve_method_call"; out: string; traitRefReg: string; method: string }
+  | {
+      op: "project_assoc_type";
+      out: string;
+      traitRefReg: string;
+      assocType: string;
+    }
+  | {
+      op: "resolve_method_call";
+      out: string;
+      traitRefReg: string;
+      method: string;
+    }
   | { op: "resolve_function_symbol"; out: string; fn: string }
   | { op: "request_fn_instantiation"; fnReg: string; typeArgRegs: string[] }
-  | { op: "instantiate_generic_symbol"; out: string; symbolReg: string; typeArgRegs: string[] }
+  | {
+      op: "instantiate_generic_symbol";
+      out: string;
+      symbolReg: string;
+      typeArgRegs: string[];
+    }
+  | { op: "field_count"; out: string; layoutReg: string }
+  | { op: "field_offset_at"; out: string; layoutReg: string; indexReg: string }
+  | { op: "field_type_at"; out: string; layoutReg: string; indexReg: string }
+  | { op: "const_lit"; out: string; value: number }
+  | { op: "add_const"; out: string; lhsReg: string; rhsReg: string }
+  | { op: "branch_lt"; leftReg: string; rightReg: string; target: number }
+  | { op: "goto"; target: number }
+  | { op: "init_instr_chunk"; out: string }
+  | {
+      op: "build_instr_chunk";
+      out: string;
+      base: string;
+      offsetReg: string;
+      typeReg: string;
+      fnReg: string;
+      indexReg: string;
+      ptrPrefix: string;
+      valPrefix: string;
+    }
+  | { op: "append_instr_chunk"; toReg: string; chunkReg: string }
   | { op: "return"; valueReg: string };
 
 // -----------------------------
@@ -334,82 +378,136 @@ class Compiler {
     const state = this.buildSpecializationState(template, typeArgs);
     this.runSpecializationWrites(template, typeArgs, state);
 
-    return template.runtime.map((instr): ConcreteInstr => {
+    const concrete: ConcreteInstr[] = [];
+    for (const instr of template.runtime) {
       switch (instr.op) {
-        case "param":
-          return {
+        case "param": {
+          concrete.push({
             op: "param",
             name: instr.name,
             ty: this.readTypeIdx(state, instr.tyIdx, `param ${instr.name}`),
-          };
+          });
+          break;
+        }
 
-        case "field_ptr":
-          return {
+        case "field_ptr": {
+          concrete.push({
             op: "field_ptr",
             out: instr.out,
             base: instr.base,
-            offset: this.readConstIdx(state, instr.offsetIdx, `field_ptr ${instr.out}`),
-          };
+            offset: this.readConstIdx(
+              state,
+              instr.offsetIdx,
+              `field_ptr ${instr.out}`,
+            ),
+          });
+          break;
+        }
 
-        case "load":
-          return {
+        case "load": {
+          concrete.push({
             op: "load",
             out: instr.out,
             ptr: instr.ptr,
             ty: this.readTypeIdx(state, instr.tyIdx, `load ${instr.out}`),
-          };
+          });
+          break;
+        }
 
-        case "call":
-          return {
+        case "call": {
+          concrete.push({
             op: "call",
             out: instr.out,
             fn: this.readSymbolIdx(state, instr.fnIdx, `call ${instr.out}`),
             args: instr.args,
-          };
+          });
+          break;
+        }
 
-        case "return":
-          return instr;
+        case "splice": {
+          const chunk = this.readInstrIdx(
+            state,
+            instr.instrIdx,
+            `splice ${instr.instrIdx}`,
+          );
+          concrete.push(...chunk);
+          break;
+        }
+
+        case "return": {
+          concrete.push(instr);
+          break;
+        }
       }
-    });
+    }
+
+    return concrete;
   }
 
-  buildSpecializationState(template: TemplateFunction, typeArgs: Type[]): SpecializationState {
+  buildSpecializationState(
+    template: TemplateFunction,
+    typeArgs: Type[],
+  ): SpecializationState {
     return {
-      typeValues: template.typeValues.map(v => (v ? this.substType(template, typeArgs, v) : null)),
+      typeValues: template.typeValues.map((v) =>
+        v ? this.substType(template, typeArgs, v) : null,
+      ),
       constValues: [...template.constValues],
       symbolValues: [...template.symbolValues],
+      instrValues: template.instrValues.map((chunk) =>
+        chunk ? [...chunk] : null,
+      ),
       typeWrites: new Set<number>(),
       constWrites: new Set<number>(),
       symbolWrites: new Set<number>(),
+      instrWrites: new Set<number>(),
     };
   }
 
-  runSpecializationWrites(template: TemplateFunction, typeArgs: Type[], state: SpecializationState) {
+  runSpecializationWrites(
+    template: TemplateFunction,
+    typeArgs: Type[],
+    state: SpecializationState,
+  ) {
     for (const write of template.specialize) {
       const value = this.evalCtBlock(template, typeArgs, state, write.instrs);
 
       switch (write.target.kind) {
         case "type": {
-          if (state.typeWrites.has(write.target.idx) || state.typeValues[write.target.idx] !== null) {
-            throw new Error(`duplicate specialization write for type idx ${write.target.idx}`);
+          if (
+            state.typeWrites.has(write.target.idx) ||
+            state.typeValues[write.target.idx] !== null
+          ) {
+            throw new Error(
+              `duplicate specialization write for type idx ${write.target.idx}`,
+            );
           }
           if (value.kind === "type") {
             state.typeValues[write.target.idx] = value.value;
           } else if (value.kind === "assoc_type") {
             state.typeValues[write.target.idx] = value.value.ty;
           } else {
-            throw new Error(`specialization write expected type-like value for idx ${write.target.idx}`);
+            throw new Error(
+              `specialization write expected type-like value for idx ${write.target.idx}`,
+            );
           }
           state.typeWrites.add(write.target.idx);
           break;
         }
 
         case "const": {
-          if (state.constWrites.has(write.target.idx) || state.constValues[write.target.idx] !== null) {
-            throw new Error(`duplicate specialization write for const idx ${write.target.idx}`);
+          if (
+            state.constWrites.has(write.target.idx) ||
+            state.constValues[write.target.idx] !== null
+          ) {
+            throw new Error(
+              `duplicate specialization write for const idx ${write.target.idx}`,
+            );
           }
           if (value.kind !== "const") {
-            throw new Error(`specialization write expected const value for idx ${write.target.idx}`);
+            throw new Error(
+              `specialization write expected const value for idx ${write.target.idx}`,
+            );
           }
           state.constValues[write.target.idx] = value.value;
           state.constWrites.add(write.target.idx);
@@ -417,14 +515,40 @@ class Compiler {
         }
 
         case "symbol": {
-          if (state.symbolWrites.has(write.target.idx) || state.symbolValues[write.target.idx] !== null) {
-            throw new Error(`duplicate specialization write for symbol idx ${write.target.idx}`);
+          if (
+            state.symbolWrites.has(write.target.idx) ||
+            state.symbolValues[write.target.idx] !== null
+          ) {
+            throw new Error(
+              `duplicate specialization write for symbol idx ${write.target.idx}`,
+            );
           }
           if (value.kind !== "symbol") {
-            throw new Error(`specialization write expected symbol value for idx ${write.target.idx}`);
+            throw new Error(
+              `specialization write expected symbol value for idx ${write.target.idx}`,
+            );
           }
           state.symbolValues[write.target.idx] = value.value;
           state.symbolWrites.add(write.target.idx);
+          break;
+        }
+
+        case "instr": {
+          if (
+            state.instrWrites.has(write.target.idx) ||
+            state.instrValues[write.target.idx] !== null
+          ) {
+            throw new Error(
+              `duplicate specialization write for instr idx ${write.target.idx}`,
+            );
+          }
+          if (value.kind !== "instr_chunk") {
+            throw new Error(
+              `specialization write expected instruction chunk for idx ${write.target.idx}`,
+            );
+          }
+          state.instrValues[write.target.idx] = value.value;
+          state.instrWrites.add(write.target.idx);
           break;
         }
       }
@@ -434,23 +558,51 @@ class Compiler {
   readTypeIdx(state: SpecializationState, idx: TypeIdx, context: string): Type {
     const value = state.typeValues[idx];
     if (value === null || value === undefined) {
-      throw new Error(`unresolved type idx ${idx} while instantiating ${context}`);
+      throw new Error(
+        `unresolved type idx ${idx} while instantiating ${context}`,
+      );
     }
     return value;
   }
 
-  readConstIdx(state: SpecializationState, idx: ConstIdx, context: string): number {
+  readConstIdx(
+    state: SpecializationState,
+    idx: ConstIdx,
+    context: string,
+  ): number {
     const value = state.constValues[idx];
     if (value === null || value === undefined) {
-      throw new Error(`unresolved const idx ${idx} while instantiating ${context}`);
+      throw new Error(
+        `unresolved const idx ${idx} while instantiating ${context}`,
+      );
     }
     return value;
   }
 
-  readSymbolIdx(state: SpecializationState, idx: SymbolIdx, context: string): SymbolId {
+  readSymbolIdx(
+    state: SpecializationState,
+    idx: SymbolIdx,
+    context: string,
+  ): SymbolId {
     const value = state.symbolValues[idx];
     if (value === null || value === undefined) {
-      throw new Error(`unresolved symbol idx ${idx} while instantiating ${context}`);
+      throw new Error(
+        `unresolved symbol idx ${idx} while instantiating ${context}`,
+      );
+    }
+    return value;
+  }
+
+  readInstrIdx(
+    state: SpecializationState,
+    idx: InstrIdx,
+    context: string,
+  ): ConcreteInstr[] {
+    const value = state.instrValues[idx];
+    if (value === null || value === undefined) {
+      throw new Error(
+        `unresolved instruction idx ${idx} while instantiating ${context}`,
+      );
     }
     return value;
   }
@@ -459,7 +611,7 @@ class Compiler {
     template: TemplateFunction,
     typeArgs: Type[],
     state: SpecializationState,
-    instrs: CtInstr[]
+    instrs: CtInstr[],
   ): CtValue {
     const regs = new Map<string, CtValue>();
 
@@ -469,7 +621,36 @@ class Compiler {
       return value;
     };
 
-    for (const instr of instrs) {
+    const expectConst = (reg: string): number => {
+      const value = read(reg);
+      if (value.kind !== "const")
+        throw new Error(`expected const in register ${reg}`);
+      return value.value;
+    };
+
+    const getFieldByIndex = (
+      layout: Layout,
+      index: number,
+    ): { name: string; offset: number; ty: Type } => {
+      const entries = Object.entries(layout.fields);
+      const field = entries[index];
+      if (!field) throw new Error(`unknown field index ${index}`);
+      const [name, data] = field;
+      return { name, offset: data.offset, ty: data.ty };
+    };
+
+    const ensureTarget = (target: number): number => {
+      if (!Number.isInteger(target) || target < 0 || target >= instrs.length) {
+        throw new Error(`invalid jump target ${target}`);
+      }
+      return target;
+    };
+
+    let nextPc = 0;
+    for (let pc = 0; pc < instrs.length; pc = nextPc) {
+      const instr = instrs[pc];
+      nextPc = pc + 1;
+
       switch (instr.op) {
         case "get_type_arg": {
           regs.set(instr.out, {
@@ -526,6 +707,119 @@ class Compiler {
           break;
         }
 
+        case "field_count": {
+          const l = read(instr.layoutReg);
+          if (l.kind !== "layout") throw new Error("expected layout");
+          regs.set(instr.out, {
+            kind: "const",
+            value: Object.keys(l.value.fields).length,
+          });
+          break;
+        }
+
+        case "field_offset_at": {
+          const l = read(instr.layoutReg);
+          if (l.kind !== "layout") throw new Error("expected layout");
+
+          const index = expectConst(instr.indexReg);
+          const field = getFieldByIndex(l.value, index);
+          regs.set(instr.out, {
+            kind: "const",
+            value: field.offset,
+          });
+          break;
+        }
+
+        case "field_type_at": {
+          const l = read(instr.layoutReg);
+          if (l.kind !== "layout") throw new Error("expected layout");
+
+          const index = expectConst(instr.indexReg);
+          const field = getFieldByIndex(l.value, index);
+          regs.set(instr.out, {
+            kind: "type",
+            value: field.ty,
+          });
+          break;
+        }
+
+        case "const_lit": {
+          regs.set(instr.out, {
+            kind: "const",
+            value: instr.value,
+          });
+          break;
+        }
+
+        case "add_const": {
+          const lhs = expectConst(instr.lhsReg);
+          const rhs = expectConst(instr.rhsReg);
+          regs.set(instr.out, {
+            kind: "const",
+            value: lhs + rhs,
+          });
+          break;
+        }
+
+        case "branch_lt": {
+          const left = expectConst(instr.leftReg);
+          const right = expectConst(instr.rightReg);
+          if (left < right) {
+            nextPc = ensureTarget(instr.target);
+          }
+          break;
+        }
+
+        case "goto": {
+          nextPc = ensureTarget(instr.target);
+          break;
+        }
+
+        case "init_instr_chunk": {
+          regs.set(instr.out, {
+            kind: "instr_chunk",
+            value: [],
+          });
+          break;
+        }
+
+        case "build_instr_chunk": {
+          const offset = expectConst(instr.offsetReg);
+          const typeVal = read(instr.typeReg);
+          if (typeVal.kind !== "type") throw new Error("expected type");
+          const fnVal = read(instr.fnReg);
+          if (fnVal.kind !== "symbol") throw new Error("expected symbol");
+          const index = expectConst(instr.indexReg);
+          const ptr = `${instr.ptrPrefix}${index}`;
+          const val = `${instr.valPrefix}${index}`;
+
+          regs.set(instr.out, {
+            kind: "instr_chunk",
+            value: [
+              { op: "field_ptr", out: ptr, base: instr.base, offset },
+              { op: "load", out: val, ptr, ty: typeVal.value },
+              {
+                op: "call",
+                out: `${instr.valPrefix}_call${index}`,
+                fn: fnVal.value,
+                args: [val],
+              },
+            ],
+          });
+          break;
+        }
+
+        case "append_instr_chunk": {
+          const target = read(instr.toReg);
+          if (target.kind !== "instr_chunk")
+            throw new Error("expected instruction chunk target");
+          const chunk = read(instr.chunkReg);
+          if (chunk.kind !== "instr_chunk")
+            throw new Error("expected instruction chunk");
+          target.value.push(...chunk.value);
+          break;
+        }
+
         case "resolve_trait": {
           const t = read(instr.typeReg);
           if (t.kind !== "type") throw new Error("expected type");
@@ -570,13 +864,17 @@ class Compiler {
 
         case "project_assoc_type": {
           const traitRef = read(instr.traitRefReg);
-          if (traitRef.kind !== "trait_ref") throw new Error("expected trait ref");
+          if (traitRef.kind !== "trait_ref")
+            throw new Error("expected trait ref");
 
-          const impl = this.resolveTrait(traitRef.value.trait, traitRef.value.forType);
+          const impl = this.resolveTrait(
+            traitRef.value.trait,
+            traitRef.value.forType,
+          );
           const ty = impl.assocTypes[instr.assocType];
           if (!ty) {
             throw new Error(
-              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no associated type ${instr.assocType}`
+              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no associated type ${instr.assocType}`,
             );
           }
 
@@ -593,13 +891,17 @@ class Compiler {
 
         case "resolve_method_call": {
           const traitRef = read(instr.traitRefReg);
-          if (traitRef.kind !== "trait_ref") throw new Error("expected trait ref");
+          if (traitRef.kind !== "trait_ref")
+            throw new Error("expected trait ref");
 
-          const impl = this.resolveTrait(traitRef.value.trait, traitRef.value.forType);
+          const impl = this.resolveTrait(
+            traitRef.value.trait,
+            traitRef.value.forType,
+          );
           const method = impl.methods[instr.method];
           if (!method) {
             throw new Error(
-              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no method ${instr.method}`
+              `impl ${traitRef.value.trait} for ${showType(traitRef.value.forType)} has no method ${instr.method}`,
             );
           }
 
@@ -639,7 +941,7 @@ class Compiler {
           const callee = this.templates.get(fn.value);
           if (!callee) throw new Error(`unknown template function ${fn.value}`);
 
-          const typeArgsForCall = instr.typeArgRegs.map(reg => {
+          const typeArgsForCall = instr.typeArgRegs.map((reg) => {
             const value = read(reg);
             if (value.kind === "type") return value.value;
             if (value.kind === "assoc_type") return value.value.ty;
@@ -648,7 +950,7 @@ class Compiler {
 
           if (typeArgsForCall.length !== callee.typeParams.length) {
             throw new Error(
-              `function ${fn.value} expected ${callee.typeParams.length} type args, got ${typeArgsForCall.length}`
+              `function ${fn.value} expected ${callee.typeParams.length} type args, got ${typeArgsForCall.length}`,
             );
           }
 
@@ -660,7 +962,7 @@ class Compiler {
           const symbol = read(instr.symbolReg);
           if (symbol.kind !== "symbol") throw new Error("expected symbol");
 
-          const typeArgsForSymbol = instr.typeArgRegs.map(reg => {
+          const typeArgsForSymbol = instr.typeArgRegs.map((reg) => {
             const value = read(reg);
             if (value.kind === "type") return value.value;
             if (value.kind === "assoc_type") return value.value.ty;
@@ -691,7 +993,9 @@ class Compiler {
   }
 
   resolveTrait(trait: string, t: Type): Impl {
-    const impl = this.impls.find(i => i.trait === trait && sameType(i.forType, t));
+    const impl = this.impls.find(
+      (i) => i.trait === trait && sameType(i.forType, t),
+    );
     if (!impl) throw new Error(`no impl ${trait} for ${showType(t)}`);
     return impl;
   }
@@ -736,9 +1040,13 @@ type LowerCtx = {
   allocTypeTarget(instrs: CtInstr[]): TypeIdx;
   allocConstTarget(instrs: CtInstr[]): ConstIdx;
   allocSymbolTarget(instrs: CtInstr[]): SymbolIdx;
+  allocInstrTarget(instrs: CtInstr[]): InstrIdx;
 };
 
-function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunction {
+function lowerFunction(
+  ast: FnAst,
+  functions: Map<string, FnAst>,
+): TemplateFunction {
   let regCounter = 0;
 
   const template: TemplateFunction = {
@@ -749,6 +1057,7 @@ function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunct
     typeValues: [],
     constValues: [],
     symbolValues: [],
+    instrValues: [],
   };
 
   const ctx: LowerCtx = {
@@ -807,6 +1116,16 @@ function lowerFunction(ast: FnAst, functions: Map<string, FnAst>): TemplateFunct
       });
       return idx;
     },
+
+    allocInstrTarget(instrs: CtInstr[]) {
+      const idx = template.instrValues.length;
+      template.instrValues.push(null);
+      template.specialize.push({
+        target: { kind: "instr", idx },
+        instrs,
+      });
+      return idx;
+    },
   };
 
   for (const param of ast.params) {
@@ -849,7 +1168,12 @@ function lowerExpr(expr: ExprAst, ctx: LowerCtx): LoweredExpr {
   }
 }
 
-function substFnType(t: Type, callee: FnAst, callTypeArgs: TypeIdx[], ctx: LowerCtx): TypeIdx {
+function substFnType(
+  t: Type,
+  callee: FnAst,
+  callTypeArgs: TypeIdx[],
+  ctx: LowerCtx,
+): TypeIdx {
   if (t.kind !== "generic") return ctx.allocTypeValue(t);
 
   const index = callee.typeParams.indexOf(t.name);
@@ -857,20 +1181,29 @@ function substFnType(t: Type, callee: FnAst, callTypeArgs: TypeIdx[], ctx: Lower
   return callTypeArgs[index];
 }
 
-function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): LoweredExpr {
+function lowerCall(
+  expr: Extract<ExprAst, { kind: "call" }>,
+  ctx: LowerCtx,
+): LoweredExpr {
   const callee = ctx.functions.get(expr.fn);
   if (!callee) throw new Error(`unknown function ${expr.fn}`);
 
   if (callee.params.length !== expr.args.length) {
-    throw new Error(`function ${expr.fn} expected ${callee.params.length} args, got ${expr.args.length}`);
+    throw new Error(
+      `function ${expr.fn} expected ${callee.params.length} args, got ${expr.args.length}`,
+    );
   }
 
   if (callee.typeParams.length !== expr.typeArgs.length) {
-    throw new Error(`function ${expr.fn} expected ${callee.typeParams.length} type args, got ${expr.typeArgs.length}`);
+    throw new Error(
+      `function ${expr.fn} expected ${callee.typeParams.length} type args, got ${expr.typeArgs.length}`,
+    );
   }
 
-  const loweredArgs = expr.args.map(arg => lowerExpr(arg, ctx));
-  const callTypeArgs: TypeIdx[] = expr.typeArgs.map(ty => ctx.allocTypeValue(ty));
+  const loweredArgs = expr.args.map((arg) => lowerExpr(arg, ctx));
+  const callTypeArgs: TypeIdx[] = expr.typeArgs.map((ty) =>
+    ctx.allocTypeValue(ty),
+  );
   const typeArgRegs: string[] = [];
   const instrs: CtInstr[] = [];
 
@@ -901,7 +1234,7 @@ function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): Low
     op: "call",
     out,
     fnIdx: symbolIdx,
-    args: loweredArgs.map(arg => arg.reg),
+    args: loweredArgs.map((arg) => arg.reg),
   });
 
   return {
@@ -910,20 +1243,33 @@ function lowerCall(expr: Extract<ExprAst, { kind: "call" }>, ctx: LowerCtx): Low
   };
 }
 
-function lowerField(expr: Extract<ExprAst, { kind: "field" }>, ctx: LowerCtx): LoweredExpr {
+function lowerField(
+  expr: Extract<ExprAst, { kind: "field" }>,
+  ctx: LowerCtx,
+): LoweredExpr {
   const base = lowerExpr(expr.base, ctx);
 
   const offsetIdx = ctx.allocConstTarget([
     { op: "resolve_type_expr", out: "Base", typeIdx: base.tyIdx },
     { op: "get_layout", out: "Layout", typeReg: "Base" },
-    { op: "field_offset", out: "Offset", layoutReg: "Layout", field: expr.field },
+    {
+      op: "field_offset",
+      out: "Offset",
+      layoutReg: "Layout",
+      field: expr.field,
+    },
     { op: "return", valueReg: "Offset" },
   ]);
 
   const tyIdx = ctx.allocTypeTarget([
     { op: "resolve_type_expr", out: "Base", typeIdx: base.tyIdx },
     { op: "get_layout", out: "Layout", typeReg: "Base" },
-    { op: "field_type", out: "FieldType", layoutReg: "Layout", field: expr.field },
+    {
+      op: "field_type",
+      out: "FieldType",
+      layoutReg: "Layout",
+      field: expr.field,
+    },
     { op: "return", valueReg: "FieldType" },
   ]);
 
@@ -950,14 +1296,23 @@ function lowerField(expr: Extract<ExprAst, { kind: "field" }>, ctx: LowerCtx): L
   };
 }
 
-function lowerAdd(leftAst: ExprAst, rightAst: ExprAst, ctx: LowerCtx): LoweredExpr {
+function lowerAdd(
+  leftAst: ExprAst,
+  rightAst: ExprAst,
+  ctx: LowerCtx,
+): LoweredExpr {
   const left = lowerExpr(leftAst, ctx);
   const right = lowerExpr(rightAst, ctx);
 
   const methodIdx = ctx.allocSymbolTarget([
     { op: "resolve_type_expr", out: "T", typeIdx: left.tyIdx },
     { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
-    { op: "resolve_method_call", out: "FnRaw", traitRefReg: "AddRef", method: "add" },
+    {
+      op: "resolve_method_call",
+      out: "FnRaw",
+      traitRefReg: "AddRef",
+      method: "add",
+    },
     {
       op: "instantiate_generic_symbol",
       out: "Fn",
@@ -970,7 +1325,12 @@ function lowerAdd(leftAst: ExprAst, rightAst: ExprAst, ctx: LowerCtx): LoweredEx
   const resultTyIdx = ctx.allocTypeTarget([
     { op: "resolve_type_expr", out: "T", typeIdx: left.tyIdx },
     { op: "prove_trait_bound", out: "AddRef", trait: "Add", typeReg: "T" },
-    { op: "project_assoc_type", out: "Output", traitRefReg: "AddRef", assocType: "Output" },
+    {
+      op: "project_assoc_type",
+      out: "Output",
+      traitRefReg: "AddRef",
+      assocType: "Output",
+    },
     { op: "return", valueReg: "Output" },
   ]);
 
@@ -1002,7 +1362,9 @@ function printTemplate(fn: TemplateFunction) {
 
   console.log("type values:");
   for (let i = 0; i < fn.typeValues.length; i++) {
-    console.log(`  [${i}] = ${fn.typeValues[i] ? showType(fn.typeValues[i]!) : "null"}`);
+    console.log(
+      `  [${i}] = ${fn.typeValues[i] ? showType(fn.typeValues[i]!) : "null"}`,
+    );
   }
   console.log("const values:");
   for (let i = 0; i < fn.constValues.length; i++) {
@@ -1011,6 +1373,11 @@ function printTemplate(fn: TemplateFunction) {
   console.log("symbol values:");
   for (let i = 0; i < fn.symbolValues.length; i++) {
     console.log(`  [${i}] = ${fn.symbolValues[i] ?? "null"}`);
+  }
+  console.log("instr values:");
+  for (let i = 0; i < fn.instrValues.length; i++) {
+    const chunk = fn.instrValues[i];
+    console.log(`  [${i}] = ${chunk ? JSON.stringify(chunk) : "null"}`);
   }
 
   console.log("specialize writes:");
@@ -1030,13 +1397,19 @@ function printConcrete(name: string, body: ConcreteInstr[]) {
         console.log(`  param ${instr.name}: ${showType(instr.ty)}`);
         break;
       case "field_ptr":
-        console.log(`  ${instr.out} = field_ptr ${instr.base}, offset ${instr.offset}`);
+        console.log(
+          `  ${instr.out} = field_ptr ${instr.base}, offset ${instr.offset}`,
+        );
         break;
       case "load":
-        console.log(`  ${instr.out} = load ${instr.ptr}: ${showType(instr.ty)}`);
+        console.log(
+          `  ${instr.out} = load ${instr.ptr}: ${showType(instr.ty)}`,
+        );
         break;
       case "call":
-        console.log(`  ${instr.out} = call ${instr.fn}(${instr.args.join(", ")})`);
+        console.log(
+          `  ${instr.out} = call ${instr.fn}(${instr.args.join(", ")})`,
+        );
         break;
       case "return":
         console.log(`  return ${instr.value}`);
@@ -1071,7 +1444,7 @@ function assertEqualList(actual: string[], expected: string[], label: string) {
   const expectedSorted = [...expected].sort();
   if (JSON.stringify(actualSorted) !== JSON.stringify(expectedSorted)) {
     throw new Error(
-      `${label} mismatch\nexpected: ${expectedSorted.join(", ")}\nactual: ${actualSorted.join(", ")}`
+      `${label} mismatch\nexpected: ${expectedSorted.join(", ")}\nactual: ${actualSorted.join(", ")}`,
     );
   }
 }
@@ -1090,6 +1463,21 @@ function registerBaseEnvironment(compiler: Compiler, includeIntAddImpl = true) {
           { name: "rhs", ty: { kind: "generic", name: "Rhs" } },
         ],
         returnTy: { kind: "generic", name: "Output" },
+        where: [],
+      },
+    },
+  });
+
+  compiler.traits.set("Print", {
+    name: "Print",
+    typeParams: [],
+    assocTypes: [],
+    methods: {
+      print: {
+        name: "print",
+        typeParams: [],
+        params: [{ name: "value", ty: { kind: "generic", name: "Self" } }],
+        returnTy: { kind: "generic", name: "Self" },
         where: [],
       },
     },
@@ -1144,6 +1532,44 @@ function registerBaseEnvironment(compiler: Compiler, includeIntAddImpl = true) {
       },
     },
   });
+
+  compiler.impls.push({
+    trait: "Print",
+    forType: Int,
+    where: [],
+    methods: {
+      print: "Int_print",
+    },
+    assocTypes: {},
+    methodSigs: {
+      print: {
+        name: "print",
+        typeParams: [],
+        params: [{ name: "value", ty: Int }],
+        returnTy: Int,
+        where: [],
+      },
+    },
+  });
+
+  compiler.impls.push({
+    trait: "Print",
+    forType: Float,
+    where: [],
+    methods: {
+      print: "Float_print",
+    },
+    assocTypes: {},
+    methodSigs: {
+      print: {
+        name: "print",
+        typeParams: [],
+        params: [{ name: "value", ty: Float }],
+        returnTy: Float,
+        where: [],
+      },
+    },
+  });
 }
 
 function makeTypeArgTemplate(): TemplateFunction {
@@ -1166,6 +1592,7 @@ function makeTypeArgTemplate(): TemplateFunction {
     typeValues: [null],
     constValues: [],
     symbolValues: [],
+    instrValues: [],
   };
 }
 
@@ -1206,12 +1633,96 @@ function makeLegacyAddTemplate(): TemplateFunction {
     typeValues: [null],
     constValues: [],
     symbolValues: [null],
+    instrValues: [],
+  };
+}
+
+function makePrintStructTemplate(): TemplateFunction {
+  return {
+    id: "printStruct",
+    typeParams: ["T"],
+    runtime: [
+      { op: "param", name: "value", tyIdx: 0 },
+      { op: "splice", instrIdx: 0 },
+      { op: "return", value: "value" },
+    ],
+    specialize: [
+      {
+        target: { kind: "type", idx: 0 },
+        instrs: [
+          { op: "get_type_arg", out: "T0", index: 0 },
+          { op: "return", valueReg: "T0" },
+        ],
+      },
+      {
+        target: { kind: "instr", idx: 0 },
+        instrs: [
+          { op: "get_type_arg", out: "T", index: 0 },
+          { op: "get_layout", out: "Layout", typeReg: "T" },
+          { op: "field_count", out: "FieldCount", layoutReg: "Layout" },
+          { op: "init_instr_chunk", out: "All" },
+          { op: "const_lit", out: "I", value: 0 },
+          { op: "const_lit", out: "One", value: 1 },
+          { op: "branch_lt", leftReg: "I", rightReg: "FieldCount", target: 8 },
+          { op: "goto", target: 17 },
+          {
+            op: "field_offset_at",
+            out: "Off",
+            layoutReg: "Layout",
+            indexReg: "I",
+          },
+          {
+            op: "field_type_at",
+            out: "FieldTy",
+            layoutReg: "Layout",
+            indexReg: "I",
+          },
+          {
+            op: "prove_trait_bound",
+            out: "PrintRef",
+            trait: "Print",
+            typeReg: "FieldTy",
+          },
+          {
+            op: "resolve_method_call",
+            out: "PrintFnRaw",
+            traitRefReg: "PrintRef",
+            method: "print",
+          },
+          {
+            op: "instantiate_generic_symbol",
+            out: "PrintFn",
+            symbolReg: "PrintFnRaw",
+            typeArgRegs: ["FieldTy"],
+          },
+          {
+            op: "build_instr_chunk",
+            out: "Chunk",
+            base: "value",
+            offsetReg: "Off",
+            typeReg: "FieldTy",
+            fnReg: "PrintFn",
+            indexReg: "I",
+            ptrPrefix: "%pf_",
+            valPrefix: "%vf_",
+          },
+          { op: "append_instr_chunk", toReg: "All", chunkReg: "Chunk" },
+          { op: "add_const", out: "I", lhsReg: "I", rhsReg: "One" },
+          { op: "goto", target: 6 },
+          { op: "return", valueReg: "All" },
+        ],
+      },
+    ],
+    typeValues: [null],
+    constValues: [],
+    symbolValues: [],
+    instrValues: [null],
   };
 }
 
 function runScenario(
   scenario: DemoScenario,
-  setup?: (compiler: Compiler) => void
+  setup?: (compiler: Compiler) => void,
 ) {
   console.log(`\n=== Scenario: ${scenario.name} ===\n`);
 
@@ -1221,8 +1732,8 @@ function runScenario(
 
   try {
     const programFns = scenario.programFns ?? [];
-    const fnIndex = new Map(programFns.map(fn => [fn.name, fn] as const));
-    const lowered = programFns.map(fn => lowerFunction(fn, fnIndex));
+    const fnIndex = new Map(programFns.map((fn) => [fn.name, fn] as const));
+    const lowered = programFns.map((fn) => lowerFunction(fn, fnIndex));
     const templates = [...lowered, ...(scenario.manualTemplates ?? [])];
 
     for (const template of templates) {
@@ -1246,11 +1757,17 @@ function runScenario(
     console.log("emitted:", emittedNames.join(", "));
 
     if (scenario.expectedErrorContains) {
-      throw new Error(`expected scenario to fail with: ${scenario.expectedErrorContains}`);
+      throw new Error(
+        `expected scenario to fail with: ${scenario.expectedErrorContains}`,
+      );
     }
 
     if (scenario.expectedEmittedExact) {
-      assertEqualList(emittedNames, scenario.expectedEmittedExact, scenario.name);
+      assertEqualList(
+        emittedNames,
+        scenario.expectedEmittedExact,
+        scenario.name,
+      );
     }
 
     for (const name of emittedNames) {
@@ -1261,7 +1778,7 @@ function runScenario(
     if (!scenario.expectedErrorContains) throw e;
     if (!message.includes(scenario.expectedErrorContains)) {
       throw new Error(
-        `${scenario.name} expected error containing "${scenario.expectedErrorContains}" but got "${message}"`
+        `${scenario.name} expected error containing "${scenario.expectedErrorContains}" but got "${message}"`,
       );
     }
     console.log(`expected error: ${message}`);
@@ -1284,7 +1801,7 @@ const scenarios: Array<{
       expectedEmittedExact: ["addX__Point", "addX__Pixel", "addX__PointF"],
       showTemplates: true,
     },
-    setup: compiler => {
+    setup: (compiler) => {
       compiler.layouts.set(showType(PointF), {
         size: 16,
         align: 8,
@@ -1347,7 +1864,11 @@ const scenarios: Array<{
         { fn: "genericOuter", typeArgs: [Int] },
         { fn: "genericInner", typeArgs: [Int] },
       ],
-      expectedEmittedExact: ["regularFn", "genericOuter__Int", "genericInner__Int"],
+      expectedEmittedExact: [
+        "regularFn",
+        "genericOuter__Int",
+        "genericInner__Int",
+      ],
     },
   },
   {
@@ -1368,12 +1889,51 @@ const scenarios: Array<{
   },
   {
     scenario: {
+      name: "printStruct ct-loop unroll",
+      manualTemplates: [makePrintStructTemplate()],
+      requests: [
+        { fn: "printStruct", typeArgs: [Point] },
+        { fn: "printStruct", typeArgs: [PointF] },
+      ],
+      expectedEmittedExact: ["printStruct__Point", "printStruct__PointF"],
+      showTemplates: true,
+    },
+    setup: (compiler) => {
+      compiler.layouts.set(showType(PointF), {
+        size: 16,
+        align: 8,
+        fields: {
+          x: { offset: 0, ty: Float },
+          y: { offset: 8, ty: Float },
+        },
+      });
+    },
+  },
+  {
+    scenario: {
+      name: "error missing print impl",
+      manualTemplates: [makePrintStructTemplate()],
+      requests: [{ fn: "printStruct", typeArgs: [Flagged] }],
+      expectedErrorContains: "no impl Print for Bool",
+    },
+    setup: (compiler) => {
+      compiler.layouts.set(showType(Flagged), {
+        size: 8,
+        align: 8,
+        fields: {
+          enabled: { offset: 0, ty: Bool },
+        },
+      });
+    },
+  },
+  {
+    scenario: {
       name: "error missing field",
       programFns: [addXAst],
       requests: [{ fn: "addX", typeArgs: [Pair] }],
       expectedErrorContains: "unknown field x",
     },
-    setup: compiler => {
+    setup: (compiler) => {
       compiler.layouts.set(showType(Pair), {
         size: 16,
         align: 8,
@@ -1391,7 +1951,7 @@ const scenarios: Array<{
       requests: [{ fn: "addX", typeArgs: [PointF] }],
       expectedErrorContains: "no impl Add for Float",
     },
-    setup: compiler => {
+    setup: (compiler) => {
       compiler.layouts.set(showType(PointF), {
         size: 16,
         align: 8,
@@ -1407,7 +1967,8 @@ const scenarios: Array<{
       name: "error bad generic arity",
       programFns: [genericInnerAst, genericOuterAst, badArityCallAst],
       requests: [],
-      expectedErrorContains: "function genericOuter expected 1 type args, got 0",
+      expectedErrorContains:
+        "function genericOuter expected 1 type args, got 0",
     },
   },
   {
